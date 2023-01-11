@@ -158,6 +158,58 @@ def test_catch_exceptions(
     assert event["transaction"] == expected_tx_name
 
 
+@pytest.mark.parametrize(
+    "url,transaction_style,expected_transaction,expected_source",
+    [
+        (
+            "/message",
+            "url",
+            "/message",
+            "route",
+        ),
+        (
+            "/message",
+            "endpoint",
+            "tests.integrations.starlite.starlite.starlite_app_factory.<locals>.message",
+            "component",
+        ),
+        (
+            "/message/123456",
+            "url",
+            "/message/{message_id}",
+            "route",
+        ),
+        (
+            "/message/123456",
+            "endpoint",
+            "tests.integrations.starlite.starlite.starlite_app_factory.<locals>.message_with_id",
+            "component",
+        ),
+    ],
+)
+def test_transaction_style(
+    sentry_init,
+    capture_events,
+    url,
+    transaction_style,
+    expected_transaction,
+    expected_source,
+):
+    sentry_init(
+        integrations=[StarliteIntegration(transaction_style=transaction_style)],
+    )
+    starlette_app = starlite_app_factory()
+
+    events = capture_events()
+
+    client = TestClient(starlette_app)
+    client.get(url)
+
+    (event,) = events
+    assert event["transaction"] == expected_transaction
+    assert event["transaction_info"] == {"source": expected_source}
+
+
 def test_middleware_spans(sentry_init, capture_events):
     sentry_init(
         traces_sample_rate=1.0,

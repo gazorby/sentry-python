@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel  # type: ignore
+
 from sentry_sdk.consts import OP
 from sentry_sdk.hub import Hub, _should_send_default_pii
 from sentry_sdk.integrations import DidNotEnable, Integration
@@ -14,10 +15,18 @@ try:
     from starlite.middleware import DefineMiddleware  # type: ignore
     from starlite.plugins.base import get_plugin_for_value  # type: ignore
     from starlite.routes.http import HTTPRoute  # type: ignore
-    from starlite.utils import ConnectionDataExtractor, is_async_callable, Ref  # type: ignore
+    from starlite.asgi.routing_trie import parse_path_to_route  # type: ignore
+    from starlite.utils import (  # type: ignore
+        ConnectionDataExtractor,
+        Ref,
+        is_async_callable,
+        normalize_path,
+    )
 
     if TYPE_CHECKING:
-        from typing import Any, Dict, List, Optional, Union
+        from typing import Any, Dict, List, Literal, Optional, Union
+
+        from starlite import MiddlewareProtocol
         from starlite.types import (  # type: ignore
             ASGIApp,
             HTTPReceiveMessage,
@@ -29,13 +38,19 @@ try:
             Send,
             WebSocketReceiveMessage,
         )
-        from starlite import MiddlewareProtocol
+
+        from sentry_sdk.scope import Scope as SentryScope
         from sentry_sdk._types import Event
+
+        TransactionStyle = Literal["endpoint", "url"]
+
 except ImportError:
     raise DidNotEnable("Starlite is not installed")
 
 
 _DEFAULT_TRANSACTION_NAME = "generic Starlite request"
+
+TRANSACTION_STYLE_VALUES = ("endpoint", "url")
 
 
 class SentryStarliteASGIMiddleware(SentryAsgiMiddleware):
@@ -50,6 +65,14 @@ class SentryStarliteASGIMiddleware(SentryAsgiMiddleware):
 
 class StarliteIntegration(Integration):
     identifier = "starlite"
+
+    def __init__(self, transaction_style: "TransactionStyle" = "url") -> None:
+        if transaction_style not in TRANSACTION_STYLE_VALUES:
+            raise ValueError(
+                f"Invalid value for transaction_style: {transaction_style} "
+                f"(must be in {TRANSACTION_STYLE_VALUES})"
+            )
+        self.transaction_style = transaction_style
 
     @staticmethod
     def setup_once() -> None:
@@ -186,6 +209,10 @@ def patch_http_route_handle() -> None:
             request: "Request[Any, Any]" = scope["app"].request_class(
                 scope=scope, receive=receive, send=send
             )
+            _set_transaction_name_and_source(
+                sentry_scope, integration.transaction_style, request
+            )
+
             extracted_request_data = ConnectionDataExtractor(
                 parse_body=True, parse_query=True
             )(request)
@@ -194,7 +221,6 @@ def patch_http_route_handle() -> None:
             request_data = await body
 
             def event_processor(event: "Event", _: "Dict[str, Any]") -> "Event":
-                route_handler = scope.get("route_handler")
 
                 request_info = event.get("request", {})
                 request_info["content_length"] = len(scope.get("_body", b""))
@@ -203,25 +229,6 @@ def patch_http_route_handle() -> None:
                 if request_data is not None:
                     request_info["data"] = request_data
 
-                func = None
-                if route_handler.name is not None:
-                    tx_name = route_handler.name
-                elif isinstance(route_handler.fn, Ref):
-                    func = route_handler.fn.value
-                else:
-                    func = route_handler.fn
-                if func is not None:
-                    tx_name = transaction_from_function(func)
-
-                tx_info = {"source": SOURCE_FOR_STYLE["endpoint"]}
-
-                if not tx_name:
-                    tx_name = _DEFAULT_TRANSACTION_NAME
-                    tx_info = {"source": TRANSACTION_SOURCE_ROUTE}
-
-                event.update(
-                    request=request_info, transaction=tx_name, transaction_info=tx_info
-                )
                 return event
 
             sentry_scope._name = StarliteIntegration.identifier
@@ -269,3 +276,36 @@ def exception_handler(exc: Exception, scope: "Scope", _: "State") -> None:
     )
 
     hub.capture_event(event, hint=hint)
+
+
+def _set_transaction_name_and_source(
+    sentry_scope: "SentryScope",
+    transaction_style: "TransactionStyle",
+    request: "Request",
+) -> None:
+    route_handler = request.scope.get("route_handler")
+
+    if transaction_style == "endpoint":
+        func = None
+        if route_handler.name is not None:
+            tx_name = route_handler.name
+        elif isinstance(route_handler.fn, Ref):
+            func = route_handler.fn.value
+        else:
+            func = route_handler.fn
+        if func is not None:
+            tx_name = transaction_from_function(func)
+    elif transaction_style == "url":
+        match = parse_path_to_route(
+            path=normalize_path(request.scope["path"]), method=request.scope["method"]
+        )
+        if match[1] is route_handler:
+            tx_name = match[2]
+
+    if not tx_name:
+        tx_name = _DEFAULT_TRANSACTION_NAME
+        source = TRANSACTION_SOURCE_ROUTE
+    else:
+        source = SOURCE_FOR_STYLE[transaction_style]
+
+    sentry_scope.set_transaction_name(tx_name, source=source)
